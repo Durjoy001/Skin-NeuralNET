@@ -796,7 +796,7 @@ def run_for_model(model_name: str):
 
     best_val_auc_es = -1.0
     epochs_no_improve = 0
-    scaler = torch.amp.GradScaler('cuda', enabled=torch.cuda.is_available())
+    scaler = torch.amp.GradScaler(enabled=torch.cuda.is_available())
 
     for epoch in range(1, EPOCHS + 1):
         print(f"\nEpoch {epoch}/{EPOCHS}")
