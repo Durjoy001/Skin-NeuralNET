@@ -682,8 +682,8 @@ def run_for_model(model_name: str):
     with open(METRICS_CSV, "a") as f:
         f.write(csv_line + "\n")
 
-    # Early stopping on validation loss
-    best_val_loss_for_es = float('inf')
+    # Early stopping on validation AUC
+    best_val_auc_es = -1.0
     epochs_no_improve = 0
 
     for epoch in range(1, EPOCHS + 1):
@@ -709,12 +709,12 @@ def run_for_model(model_name: str):
             f.write(csv_line + "\n")
 
         # Early stopping
-        if val_loss < (best_val_loss_for_es - MIN_DELTA):
-            best_val_loss_for_es = val_loss
+        if val_auc > best_val_auc_es + MIN_DELTA:
+            best_val_auc_es = val_auc
             epochs_no_improve = 0
         else:
             epochs_no_improve += 1
-            print(f"[ES] No val-loss improvement for {epochs_no_improve}/{PATIENCE} epoch(s).")
+            print(f"[ES] No val-AUC improvement for {epochs_no_improve}/{PATIENCE} epoch(s).")
 
         if val_auc > best_val_auc:
             best_val_auc = val_auc
