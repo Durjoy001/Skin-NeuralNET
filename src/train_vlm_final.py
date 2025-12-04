@@ -58,8 +58,8 @@ METRICS_CSV = None
 THRESHOLDS_PATH = None
 SAVE_PATH_ANY = None
 
-PATIENCE = 10
-MIN_DELTA = 1e-4
+PATIENCE = 7        # early stopping on val AUC (decreased to prevent overfitting)
+MIN_DELTA = 1e-4    # minimum improvement to be considered "better"
 
 # ----------------------
 # Reproducibility
@@ -155,26 +155,32 @@ def vlm_transforms(model_name: str, train: bool):
     if "clip" in model_name:
         # OpenCLIP-aligned transforms without instantiating a model (avoid double load)
         size = 336 if "336" in model_name else 224
-        aug = [
-            transforms.RandomResizedCrop(size, scale=(0.9, 1.0), interpolation=InterpolationMode.BICUBIC),
-            transforms.RandomHorizontalFlip(),
-            transforms.ColorJitter(0.1, 0.1, 0.1, 0.05),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=(0.48145466, 0.4578275, 0.40821073),
-                std=(0.26862954, 0.26130258, 0.27577711),
-            ),
-        ]
-        eval_tf = [
-            transforms.Resize(size, interpolation=InterpolationMode.BICUBIC, antialias=True),
-            transforms.CenterCrop(size),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=(0.48145466, 0.4578275, 0.40821073),
-                std=(0.26862954, 0.26130258, 0.27577711),
-            ),
-        ]
-        return transforms.Compose(aug if train else eval_tf)
+        if train:
+            # Enhanced data augmentation to reduce overfitting
+            aug = [
+                transforms.RandomResizedCrop(size, scale=(0.85, 1.0), interpolation=InterpolationMode.BICUBIC),  # More aggressive cropping
+                transforms.RandomHorizontalFlip(0.5),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),  # Increased color jitter
+                transforms.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1)),  # Geometric augmentation
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=(0.48145466, 0.4578275, 0.40821073),
+                    std=(0.26862954, 0.26130258, 0.27577711),
+                ),
+                transforms.RandomErasing(p=0.2, scale=(0.02, 0.1)),  # Random erasing
+            ]
+            return transforms.Compose(aug)
+        else:
+            eval_tf = [
+                transforms.Resize(size, interpolation=InterpolationMode.BICUBIC, antialias=True),
+                transforms.CenterCrop(size),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=(0.48145466, 0.4578275, 0.40821073),
+                    std=(0.26862954, 0.26130258, 0.27577711),
+                ),
+            ]
+            return transforms.Compose(eval_tf)
 
     elif "siglip" in model_name:
         # Use timm's official config (with caching to avoid rebuilding)
@@ -211,6 +217,18 @@ def vlm_transforms(model_name: str, train: bool):
         if timm_name not in _SIGLIP_CFG_CACHE:
             _SIGLIP_CFG_CACHE[timm_name] = timm.data.resolve_data_config({}, model=tmp)
         cfg = _SIGLIP_CFG_CACHE[timm_name]
+        
+        # Enhanced data augmentation for training to reduce overfitting
+        if train:
+            # Override augmentation parameters for stronger regularization
+            # Note: Only set parameters that timm's create_transform accepts
+            cfg['hflip'] = 0.5  # Horizontal flip probability
+            cfg['color_jitter'] = 0.4  # Color jitter strength (increased from default)
+            cfg['auto_augment'] = 'rand-m9-mstd0.5-inc1'  # RandAugment for stronger augmentation
+            cfg['re_prob'] = 0.25  # Random erasing probability
+            cfg['re_mode'] = 'pixel'
+            cfg['re_count'] = 1
+        
         return timm.data.create_transform(**cfg, is_training=train)
 
     else:
@@ -362,10 +380,10 @@ class SigLIPWrapper(nn.Module):
         self.backbone = backbone
         in_features = backbone.num_features
         self.classifier = nn.Sequential(
-            nn.Dropout(0.5),
+            nn.Dropout(0.6),  # Increased from 0.5 to reduce overfitting
             nn.Linear(in_features, 256),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.4),  # Increased from 0.3 to reduce overfitting
             nn.Linear(256, len(class_names)),
         )
 
@@ -510,14 +528,14 @@ def train_one_epoch(model, loader, criterion, optimizer, device, scaler, accum_s
             scaler.scale(loss).backward()
             if step % accum_steps == 0:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)  # Reduced from 1.0 for stronger regularization
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
         else:
             loss.backward()
             if step % accum_steps == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)  # Reduced from 1.0 for stronger regularization
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
@@ -537,11 +555,11 @@ def train_one_epoch(model, loader, criterion, optimizer, device, scaler, accum_s
     if (step % accum_steps) != 0:
         if scaler.is_enabled():
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)  # Reduced from 1.0 for stronger regularization
             scaler.step(optimizer)
             scaler.update()
         else:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)  # Reduced from 1.0 for stronger regularization
             optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
@@ -956,16 +974,16 @@ def run_for_model(model_name: str):
         model.logit_scale.requires_grad = True
         model.class_bias.requires_grad = True
         stage1_params = [
-            {"params": [model.logit_scale, model.class_bias], "lr": 1e-4, "weight_decay": 0.0},
+            {"params": [model.logit_scale, model.class_bias], "lr": 6e-5, "weight_decay": 0.01},  # Reduced LR, added weight decay
         ]
     elif isinstance(model, SigLIPWrapper):
         for p in model.classifier.parameters():
             p.requires_grad = True
         stage1_params = [
-            {"params": model.classifier.parameters(), "lr": 5e-4, "weight_decay": 0.0},
+            {"params": model.classifier.parameters(), "lr": 3e-4, "weight_decay": 0.01},  # Reduced LR, added weight decay
         ]
     else:
-        stage1_params = [{"params": model.parameters(), "lr": 5e-5, "weight_decay": 0.05}]
+        stage1_params = [{"params": model.parameters(), "lr": 3e-5, "weight_decay": 0.1}]  # Reduced LR, increased weight decay
 
     optimizer = torch.optim.AdamW(stage1_params)
     scheduler = cosine_with_warmup(optimizer, warmup_epochs=5, total_epochs=EPOCHS)
@@ -1051,23 +1069,23 @@ def run_for_model(model_name: str):
             unfreeze_last_vit_blocks(model, n_blocks=UNFREEZE_BLOCKS)
             if isinstance(model, CLIPWrapper):
                 params = [
-                    {"params": [model.logit_scale, model.class_bias], "lr": 1e-4, "weight_decay": 0.0},
+                    {"params": [model.logit_scale, model.class_bias], "lr": 6e-5, "weight_decay": 0.01},  # Reduced LR, added weight decay
                 ]
                 last_blocks = list(model.base_model.visual.transformer.resblocks)[-UNFREEZE_BLOCKS:]
                 block_params = []
                 for b in last_blocks:
                     block_params += [p for p in b.parameters() if p.requires_grad]
-                params.append({"params": block_params, "lr": 1e-5, "weight_decay": 0.05})
+                params.append({"params": block_params, "lr": 6e-6, "weight_decay": 0.1})  # Reduced LR, increased weight decay
             else:  # SigLIPWrapper
                 params = [
-                    {"params": model.classifier.parameters(), "lr": 5e-4, "weight_decay": 0.0},
+                    {"params": model.classifier.parameters(), "lr": 3e-4, "weight_decay": 0.01},  # Reduced LR, added weight decay
                 ]
                 if hasattr(model.backbone, "blocks"):
                     last_blocks = list(model.backbone.blocks)[-UNFREEZE_BLOCKS:]
                     block_params = []
                     for b in last_blocks:
                         block_params += [p for p in b.parameters() if p.requires_grad]
-                    params.append({"params": block_params, "lr": 1e-5, "weight_decay": 0.05})
+                    params.append({"params": block_params, "lr": 6e-6, "weight_decay": 0.1})  # Reduced LR, increased weight decay
 
             optimizer = torch.optim.AdamW(params)
             scheduler = cosine_with_warmup(
